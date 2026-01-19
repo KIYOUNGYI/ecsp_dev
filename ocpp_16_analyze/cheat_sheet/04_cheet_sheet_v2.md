@@ -1602,10 +1602,273 @@ MeterValues.req 전송 시작 (60초마다)
 
 ---
 
-## 📚 참고
+### 📊 meterStart / meterStop의 진실: 누적값이다! 🎯
+
+#### 🚨 핵심 규칙 (OCPP 1.6 스펙 - 07_Types.md)
+
+> **MUST**: 모든 "Register" 값은 시간에 따라 **단조 증가**해야 한다  
+> **SHOULD NOT**: 트랜잭션 시작 시 **0으로 리셋하면 안 된다**
+
+**출처**: `/ocpp_16_analyze/07_Types.md` 줄 478-480
+
+---
+
+#### � OCPP 스펙 원문
+
+> **참고:** 단일 충전 트랜잭션 또는 비트랜잭션 소비자(예: 충전기 내부 전원 공급 장치, 전체 공급)와 관련된 모든 **"Register" 값은 시간에 따라 단조 증가해야 한다(MUST)**.
+>
+> 보고된 ".Register" 값에 해당하는 실제 에너지 양은 해당 레지스터 값에서 트랜잭션 시작 시 또는 기타 관련 시작 참조 시점에 기록/보고된 레지스터 값을 뺀 값으로 계산된다. 감사 가능성 향상을 위해 **".Register" 값은 전기 계량 하드웨어의 비휘발성 레지스터에서 직접 읽은 그대로 정확히 보고되어야 하며(SHOULD), 트랜잭션 시작 시 0으로 재설정되어서는 안 된다(SHOULD NOT)**. 이를 통해 중앙 시스템이 **트랜잭션의 시작 레지스터 값이 동일한 커넥터의 이전 트랜잭션 종료 레지스터 값과 동일한지 확인**할 수 있어 하드웨어 결함, 배선 오류, 사기 등으로 인한 순차 트랜잭션 간의 "누락 에너지"를 식별할 수 있다.
+
+---
+
+#### 🚗 자동차 주행거리계(ODO)처럼!
+
+```
+🚗 자동차 주행거리계 (Odometer)
+   - 리셋 안 됨
+   - 계속 누적됨
+   
+⚡ 충전기 에너지 미터 (Energy.Active.Import.Register)
+   - 리셋 안 됨 (SHOULD NOT)
+   - 계속 누적됨 (MUST be monotonically increasing)
+```
+
+---
+
+#### 💡 예시: 연속된 3번의 충전
+
+```typescript
+// 트랜잭션 1
+StartTransaction.req {
+  meterStart: 0 Wh      // 처음 설치 후 0부터 시작
+}
+StopTransaction.req {
+  meterStop: 250 Wh     // 250Wh 충전
+}
+// → 실제 사용량: 250 - 0 = 250 Wh ✅
+
+// 트랜잭션 2 (바로 다음 고객)
+StartTransaction.req {
+  meterStart: 250 Wh    // ✅ 트랜잭션 1의 meterStop과 동일!
+}
+StopTransaction.req {
+  meterStop: 480 Wh
+}
+// → 실제 사용량: 480 - 250 = 230 Wh ✅
+
+// 트랜잭션 3
+StartTransaction.req {
+  meterStart: 480 Wh    // ✅ 트랜잭션 2의 meterStop과 동일!
+}
+StopTransaction.req {
+  meterStop: 720 Wh
+}
+// → 실제 사용량: 720 - 480 = 240 Wh ✅
+```
+
+---
+
+#### 🚨 만약 리셋한다면? (잘못된 구현)
+
+```typescript
+// ❌ 잘못된 구현: 매번 0으로 리셋
+
+// 트랜잭션 1
+StartTransaction.req { meterStart: 0 }
+StopTransaction.req { meterStop: 250 }
+// → 사용량: 250 Wh
+
+// 트랜잭션 2 (리셋!)
+StartTransaction.req { meterStart: 0 }  // ❌ 리셋됨!
+StopTransaction.req { meterStop: 230 }
+// → 사용량: 230 Wh
+
+// 🚨 중앙 시스템의 감사 검증:
+트랜잭션 1 종료: 250 Wh
+트랜잭션 2 시작: 0 Wh
+→ 250 Wh가 사라졌네? 🚨 "누락 에너지" 감지!
+→ 사기 혐의! 경고 발생!
+```
+
+---
+
+#### 🔐 감사(Audit) 목적: 누락 에너지 검출
+
+OCPP가 누적값을 요구하는 이유는 **사기 방지**입니다!
+
+```typescript
+// 중앙 시스템의 감사 로직
+function auditEnergyLoss(prevTx, currentTx) {
+  const prevMeterStop = prevTx.meterStop;      // 이전 트랜잭션 종료값
+  const currentMeterStart = currentTx.meterStart; // 현재 트랜잭션 시작값
+  
+  if (prevMeterStop !== currentMeterStart) {
+    const missingEnergy = currentMeterStart - prevMeterStop;
+    
+    console.warn(`⚠️ 누락 에너지 감지!`);
+    console.warn(`이전 종료: ${prevMeterStop} Wh`);
+    console.warn(`현재 시작: ${currentMeterStart} Wh`);
+    console.warn(`누락량: ${missingEnergy} Wh`);
+    
+    // 가능한 원인:
+    // 1. 하드웨어 결함 (미터 고장)
+    // 2. 배선 오류
+    // 3. 사기 (몰래 충전)
+    // 4. 충전기 내부 전원 사용
+    
+    await sendAlert(currentTx.chargePointId, missingEnergy);
+  }
+}
+```
+
+---
+
+#### 📊 실전 시나리오: 감사 추적
+
+```
+=== 충전소 하루 운영 ===
+
+06:00 → 충전기 부팅
+        현재 미터: 10,000 Wh (전날까지 누적)
+
+08:00 → 트랜잭션 #1
+        Start: 10,000 Wh
+        Stop:  10,500 Wh
+        사용량: 500 Wh ✅
+
+10:00 → 트랜잭션 #2
+        Start: 10,500 Wh ✅ (이전 종료값과 동일)
+        Stop:  11,200 Wh
+        사용량: 700 Wh ✅
+
+12:00 → 트랜잭션 #3
+        Start: 11,200 Wh ✅
+        Stop:  11,800 Wh
+        사용량: 600 Wh ✅
+
+14:00 → 🚨 의심스러운 상황!
+        트랜잭션 #4
+        Start: 12,100 Wh ❌ (이전 종료값: 11,800 Wh)
+        → 300 Wh 누락! 🚨
+        
+        가능성:
+        1. 누군가 12:00-14:00 사이에 몰래 충전?
+        2. 충전기 내부 전원 사용?
+        3. 미터 고장?
+        
+        → 조사 필요! 📋
+```
+
+---
+
+#### 🎯 정리: meterStart/meterStop 규칙
+
+| 항목 | 규칙 | 근거 |
+|------|------|------|
+| **타입** | integer (Wh 단위) | 06_Messages.md |
+| **동작** | 누적값 (MUST be monotonically increasing) | 07_Types.md 줄 478 |
+| **리셋 금지** | 트랜잭션 시작 시 0으로 리셋하면 안 됨 (SHOULD NOT) | 07_Types.md 줄 480 |
+| **원본 보고** | 하드웨어 레지스터 값 그대로 보고 (SHOULD) | 07_Types.md 줄 480 |
+| **사용량 계산** | `meterStop - meterStart` | 스펙 |
+| **감사 규칙** | `트랜잭션 N의 meterStart = 트랜잭션 N-1의 meterStop` | 07_Types.md 줄 480 |
+| **목적** | 누락 에너지 검출, 사기 방지 | 스펙 |
+
+---
+
+#### 💻 개발자 체크리스트
+
+```typescript
+// ✅ 올바른 구현
+class ChargePoint {
+  private meterRegister: number = 0; // 누적값 (비휘발성 메모리)
+  
+  async startTransaction(idTag: string) {
+    const meterStart = this.readMeterRegister(); // 현재 누적값 읽기
+    
+    const response = await this.send({
+      action: "StartTransaction",
+      payload: {
+        connectorId: 1,
+        idTag: idTag,
+        meterStart: meterStart,  // ✅ 누적값 그대로 전송
+        timestamp: new Date().toISOString()
+      }
+    });
+    
+    return response.transactionId;
+  }
+  
+  async stopTransaction(transactionId: number) {
+    const meterStop = this.readMeterRegister(); // 현재 누적값 읽기
+    
+    await this.send({
+      action: "StopTransaction",
+      payload: {
+        transactionId: transactionId,
+        meterStop: meterStop,  // ✅ 누적값 그대로 전송
+        timestamp: new Date().toISOString()
+      }
+    });
+  }
+  
+  private readMeterRegister(): number {
+    // ✅ 하드웨어 레지스터에서 직접 읽기
+    // ❌ 트랜잭션마다 0으로 리셋하면 안 됨!
+    return this.meterRegister;
+  }
+  
+  private incrementMeter(wh: number) {
+    this.meterRegister += wh;  // ✅ 계속 누적
+    this.saveToNonVolatileMemory(this.meterRegister); // 정전 대비
+  }
+}
+```
+
+---
+
+#### 🔍 디버깅 팁
+
+```typescript
+// 중앙 시스템에서 누락 에너지 모니터링
+async function checkEnergyIntegrity(chargePointId: string) {
+  const transactions = await db.getTransactions(chargePointId, {
+    orderBy: 'timestamp',
+    status: 'completed'
+  });
+  
+  for (let i = 1; i < transactions.length; i++) {
+    const prev = transactions[i - 1];
+    const curr = transactions[i];
+    
+    if (prev.meterStop !== curr.meterStart) {
+      const gap = curr.meterStart - prev.meterStop;
+      
+      console.warn(`⚠️ Energy gap detected!`);
+      console.warn(`Charge Point: ${chargePointId}`);
+      console.warn(`Between Tx ${prev.id} and Tx ${curr.id}`);
+      console.warn(`Gap: ${gap} Wh`);
+      console.warn(`Time: ${prev.stopTime} → ${curr.startTime}`);
+      
+      // 알림 전송
+      await sendAlert({
+        type: 'ENERGY_GAP',
+        chargePointId: chargePointId,
+        gap: gap,
+        transactions: [prev.id, curr.id]
+      });
+    }
+  }
+}
+```
+
+---
+
+## �📚 참고
 
 - 원문: `/ocpp_16_analyze/04_Operations_Initiated_by_Charge_Point.md` - 4.8 Start Transaction
+- OCPP 스펙: `/ocpp_16_analyze/07_Types.md` - 줄 478-480 (Register 값 규칙)
 - 검수 완료: ✅ 2026-01-17
+- **meterStart/meterStop 누적 규칙 추가**: ✅ 2026-01-19
 
 ---
 
@@ -2362,5 +2625,362 @@ Charging → Faulted (10시, 현재 계속)
 📌 경고 vs 에러
    → status ≠ Faulted → 경고
    → status = Faulted → 에러
+```
+
+---
+
+## 🛑 4.10 Stop Transaction (트랜잭션 종료)
+
+### 📌 핵심 개념
+
+**Stop Transaction**은 충전 세션을 종료하고 최종 정산 데이터를 전송하는 메시지입니다.
+
+### 🧒 어린이용 설명
+
+```
+⚡ 충전 중
+    ↓
+🔌 차량 연결 해제 or 💳 카드 태그
+    ↓
+🛑 충전 종료!
+    ↓
+📊 얼마 썼는지 계산
+    - 시작: 1000Wh
+    - 끝: 1250Wh
+    - 사용: 250Wh ⚡
+    ↓
+📤 "충전 끝났어요!" (StopTransaction.req)
+    ↓
+✅ "잘 받았어!" (StopTransaction.conf)
+    ↓
+🔓 케이블 잠금 해제
+    ↓
+😊 다음 손님 대기
+```
+
+### 📋 메시지 구조
+
+```json
+// StopTransaction.req (CP → CSMS)
+{
+  "transactionId": 12345,
+  "idTag": "USER001",          // MAY (사용자 중지 시)
+  "meterStop": 1250,            // MUST
+  "timestamp": "2026-01-18T11:00:00Z",
+  "reason": "EVDisconnected",   // SHOULD (비정상 종료 시)
+  "transactionData": [...]      // MAY (MeterValues 데이터)
+}
+
+// StopTransaction.conf (CSMS → CP)
+{
+  "idTagInfo": {
+    "status": "Accepted",
+    "expiryDate": "2027-01-18T00:00:00Z"
+  }
+}
+```
+
+---
+
+### 🎭 역할별 책임 매트릭스
+
+#### 📋 프로세스 단계별 책임
+
+| 단계                      | 충전기 (CP) 개발자 👨‍💻                                                                                                                                      | 중앙 시스템 (CSMS) 개발자 👩‍💻                                                                                                 |
+|-------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------|
+| **1️⃣ 충전 종료 감지**        | ✅ 종료 트리거 감지:<br>- 사용자 RFID 태그<br>- 차량 만충 (SoC 100%)<br>- EV 측 연결 해제<br>- 비상 정지<br>- Reset 명령                                                          | -                                                                                                                      |
+| **2️⃣ StopTransaction 전송** | ✅ **MUST**: StopTransaction.req 전송<br>✅ **MUST**: transactionId 포함<br>✅ **MAY**: idTag 포함 (사용자 중지 시)<br>✅ **MAY**: transactionData 포함 (미터 데이터)<br>✅ reason 설정 | -                                                                                                                      |
+| **3️⃣ 응답 처리**            | ✅ StopTransaction.conf 수신<br>✅ **SHALL**: Authorization Cache 업데이트<br>(idTag가 Local List에 없을 때)                                                       | ✅ **MUST**: StopTransaction.conf 응답 전송<br>✅ **MUST**: 모든 요청/응답 이벤트 로그 저장<br>✅ **MAY**: idTagInfo 포함<br>✅ 정산 데이터 저장 |
+| **4️⃣ 케이블 잠금 해제**        | ✅ **MUST**: 케이블 잠금 해제<br>(영구 부착이 아닐 때)<br>✅ 설정 키 확인:<br>- UnlockConnectorOnEVSideDisconnect                                                            | -                                                                                                                      |
+| **5️⃣ 상태 업데이트**          | ✅ StatusNotification 전송<br>(status: Available)                                                                                                         | ✅ 충전기 상태 업데이트<br>✅ 트랜잭션 종료 처리<br>✅ 요금 계산                                                                              |
+
+---
+
+#### ⚙️ EV 측 연결 해제 동작 (Configuration Keys)
+
+| 설정                                    | 값       | 동작                                                                | 사용 시나리오                  |
+|---------------------------------------|---------|-------------------------------------------------------------------|--------------------------|
+| **StopTransactionOnEVSideDisconnect** | `true`  | ✅ EV 연결 해제 시 즉시 트랜잭션 중지<br>✅ 케이블 재연결해도 충전 불가<br>✅ 새 트랜잭션 필요      | 🔒 **보안 중시** (방해 행위 방지)   |
+| **StopTransactionOnEVSideDisconnect** | `false` | ❌ EV 연결 해제해도 트랜잭션 유지<br>✅ 케이블 재연결하면 충전 계속<br>⚠️ 다른 차량이 충전 가능 (위험!) | 🔓 **편의성 중시** (재연결 허용)    |
+| **UnlockConnectorOnEVSideDisconnect** | `true`  | ✅ EV 연결 해제 시 충전기 커넥터도 잠금 해제                                        | 👤 사용자 편의 (케이블 쉽게 분리)     |
+| **UnlockConnectorOnEVSideDisconnect** | `false` | ❌ EV 연결 해제해도 충전기 커넥터 잠금 유지<br>✅ 사용자가 RFID 태그해야 잠금 해제               | 🔒 케이블 도난 방지              |
+
+**우선순위 규칙:**
+```
+StopTransactionOnEVSideDisconnect = false
+    ↓
+UnlockConnectorOnEVSideDisconnect 무시!
+    ↓
+케이블 항상 잠금 상태 유지 🔒
+```
+
+**보안 권장 설정:**
+```json
+{
+  "StopTransactionOnEVSideDisconnect": "true",   // ✅ 방해 행위 방지
+  "UnlockConnectorOnEVSideDisconnect": "true"    // ✅ 사용자 편의
+}
+```
+
+---
+
+#### 💡 핵심 체크리스트
+
+**충전기 개발자 ✅**
+
+- [ ] **MUST**: 트랜잭션 종료 시 StopTransaction.req 전송
+- [ ] **MUST**: transactionId 필수 포함
+- [ ] **MUST**: meterStop 값 정확히 측정
+- [ ] **MUST**: 정상 종료 시 케이블 잠금 해제
+- [ ] **MAY**: idTag 포함 (사용자 중지 시)
+- [ ] **MAY**: transactionData 포함 (MeterValues 데이터)
+- [ ] **SHOULD**: reason 설정 (비정상 종료 시)
+- [ ] **SHALL**: Authorization Cache 업데이트 (응답 받은 후)
+- [ ] EV 측 연결 해제 동작 구현 (Configuration Keys)
+
+**중앙 시스템 개발자 ✅**
+
+- [ ] **MUST**: StopTransaction.conf 응답 전송
+- [ ] **MUST**: 모든 요청/응답 이벤트 로그 저장
+- [ ] **MUST**: 응답 실패하더라도 반드시 conf 전송 (재전송 방지)
+- [ ] **MAY**: idTagInfo 포함 (Authorization Cache 업데이트용)
+- [ ] **SHOULD**: 데이터 정상성 검사 (하지만 응답은 필수!)
+- [ ] 트랜잭션 종료 처리 (정산, 요금 계산)
+- [ ] **중요**: 트랜잭션 중지를 방지할 수 없음! (수신만 확인)
+
+---
+
+### 📊 Reason 값
+
+| Reason            | 의미         | 발생 시나리오                     | idTag 필요? |
+|-------------------|------------|------------------------------|----------|
+| **Local**         | 로컬 중지 (정상) | 사용자가 RFID 태그로 정상 종료          | ✅ 필수     |
+| **EVDisconnected** | 차량 연결 해제   | 차량이 커넥터 분리                   | ❌ 옵션     |
+| **EmergencyStop** | 비상 정지      | 비상 버튼 누름                     | ❌ 옵션     |
+| **Remote**        | 원격 중지      | CSMS가 RemoteStopTransaction    | ❌ 생략     |
+| **HardReset**     | 하드 리셋      | CSMS가 Reset.req (Hard)        | ❌ 생략     |
+| **SoftReset**     | 소프트 리셋     | CSMS가 Reset.req (Soft)        | ❌ 생략     |
+| **PowerLoss**     | 전력 손실      | 정전, 충전기 전원 차단                | ❌ 생략     |
+| **Reboot**        | 재부팅        | 충전기 자체 재부팅                   | ❌ 생략     |
+| **UnlockCommand** | 잠금 해제 명령   | CSMS가 UnlockConnector           | ❌ 생략     |
+| **DeAuthorized**  | 인증 해제      | Authorization 만료/취소            | ❌ 옵션     |
+| **Other**         | 기타         | 기타 사유                        | ❌ 옵션     |
+
+**idTag 생략 규칙:**
+```typescript
+// 충전기 자체가 중지하는 경우 idTag 생략 가능
+if (reason === 'Remote' || reason === 'HardReset' || reason === 'SoftReset') {
+  // idTag 생략 OK
+  return { transactionId, meterStop, timestamp, reason };
+}
+
+// 사용자가 중지하는 경우 idTag 필수
+if (reason === 'Local') {
+  // idTag 필수!
+  return { transactionId, idTag, meterStop, timestamp, reason };
+}
+```
+
+---
+
+### 🎬 실전 시나리오
+
+#### 시나리오 1: 정상 종료 (사용자가 RFID로 중지)
+```
+10:00:07 → StartTransaction (transactionId: 789, meterStart: 1000)
+10:05:00 → MeterValues (currentMeter: 1050)
+10:10:00 → MeterValues (currentMeter: 1100)
+10:15:00 → MeterValues (currentMeter: 1150)
+10:20:00 → 사용자가 RFID 카드 태그 💳
+10:20:01 → StopTransaction.req (
+              transactionId: 789,
+              idTag: "USER_CARD_001",  // ✅ 사용자 중지이므로 필수!
+              meterStop: 1200,
+              timestamp: "2026-01-18T10:20:01Z",
+              reason: "Local"  // 또는 생략 (기본값)
+            )
+10:20:02 → StopTransaction.conf (idTagInfo: { status: "Accepted" })
+10:20:02 → 케이블 잠금 해제 🔓
+10:20:03 → 충전 종료, 사용량: 200Wh (1200 - 1000)
+10:20:03 → StatusNotification (status: Available)
+```
+
+#### 시나리오 2: EV 측 연결 해제 (StopTransactionOnEVSideDisconnect=true)
+```
+10:00:00 → 충전 중... ⚡
+10:15:00 → 사용자가 EV 측에서 케이블 뽑음 🔌
+10:15:01 → StatusNotification (status: Finishing, errorCode: NoError, info: "EV side disconnected")
+10:15:02 → StopTransaction.req (
+              transactionId: 789,
+              idTag: null,  // ❌ EV 연결 해제이므로 생략 가능
+              meterStop: 1150,
+              timestamp: "2026-01-18T10:15:02Z",
+              reason: "EVDisconnected"
+            )
+10:15:03 → StopTransaction.conf
+10:15:03 → 케이블 잠금 해제 🔓 (UnlockConnectorOnEVSideDisconnect=true)
+10:15:04 → StatusNotification (status: Available)
+```
+
+#### 시나리오 3: 원격 중지 (CSMS 명령)
+```
+10:00:00 → 충전 중... ⚡
+10:10:00 → CS: RemoteStopTransaction.req (transactionId: 789)
+10:10:01 → CP: RemoteStopTransaction.conf (status: Accepted)
+10:10:02 → 충전 중지
+10:10:03 → CP: StopTransaction.req (
+              transactionId: 789,
+              idTag: null,  // ❌ Remote 중지이므로 생략
+              meterStop: 1100,
+              timestamp: "2026-01-18T10:10:03Z",
+              reason: "Remote"
+            )
+10:10:04 → CS: StopTransaction.conf
+10:10:04 → 케이블 잠금 해제 🔓
+```
+
+#### 시나리오 4: 비상 정지
+```
+10:00:00 → 충전 중... ⚡
+10:08:00 → 사용자가 비상 정지 버튼 누름! 🚨
+10:08:01 → 즉시 충전 중단
+10:08:01 → StatusNotification (status: Faulted, errorCode: EmergencyStop)
+10:08:02 → StopTransaction.req (
+              transactionId: 789,
+              idTag: null,  // ❌ 비상 정지이므로 생략 가능
+              meterStop: 1080,
+              timestamp: "2026-01-18T10:08:02Z",
+              reason: "EmergencyStop"
+            )
+10:08:03 → StopTransaction.conf
+10:08:03 → 관리자에게 알림 발송 📧
+```
+
+---
+
+### 📦 transactionData 활용
+
+```json
+{
+  "transactionId": 789,
+  "idTag": "USER001",
+  "meterStop": 1250,
+  "timestamp": "2026-01-18T11:00:00Z",
+  "reason": "Local",
+  "transactionData": [
+    {
+      "timestamp": "2026-01-18T10:30:00Z",
+      "sampledValue": [
+        {
+          "value": "1100",
+          "context": "Sample.Periodic",
+          "measurand": "Energy.Active.Import.Register",
+          "unit": "Wh"
+        }
+      ]
+    },
+    {
+      "timestamp": "2026-01-18T10:45:00Z",
+      "sampledValue": [
+        {
+          "value": "1200",
+          "context": "Sample.Periodic",
+          "measurand": "Energy.Active.Import.Register",
+          "unit": "Wh"
+        }
+      ]
+    }
+  ]
+}
+```
+
+**transactionData 활용:**
+- 📊 MeterValues.req를 전송하지 못한 경우 (오프라인)
+- 📈 정산용 상세 데이터 제공
+- 🔍 분쟁 해결용 증거 자료
+- ⚡ 실시간 전송 실패 시 백업
+
+---
+
+### 🔧 EV 측 연결 해제 동작 상세
+
+#### 설정 조합별 동작
+
+| StopTxOnEVDisconnect | UnlockOnEVDisconnect | EV 연결 해제 시 동작                                  | 보안 수준 | 사용 시나리오         |
+|----------------------|----------------------|------------------------------------------------|-------|-----------------|
+| `true`               | `true`               | ✅ 트랜잭션 즉시 중지<br>✅ 커넥터 잠금 해제<br>✅ 케이블 자유롭게 분리 | 🔒🔒   | **권장** (일반 사용)   |
+| `true`               | `false`              | ✅ 트랜잭션 즉시 중지<br>❌ 커넥터 잠금 유지<br>✅ RFID 필요     | 🔒🔒🔒 | 케이블 도난 방지 (공공장소) |
+| `false`              | `true`               | ❌ 트랜잭션 유지<br>❌ **잠금 유지** (우선순위!)              | 🔒    | (설정 오류 - 비권장)   |
+| `false`              | `false`              | ❌ 트랜잭션 유지<br>❌ 커넥터 잠금 유지<br>⚠️ 다른 차량 충전 가능!   | ⚠️    | (위험! - 비권장)     |
+
+**우선순위 규칙:**
+```typescript
+if (StopTransactionOnEVSideDisconnect === false) {
+  // UnlockConnectorOnEVSideDisconnect 무시!
+  // 케이블은 항상 잠금 상태 유지
+  return { locked: true, transactionActive: true };
+}
+
+if (StopTransactionOnEVSideDisconnect === true) {
+  // UnlockConnectorOnEVSideDisconnect 적용
+  return {
+    locked: !UnlockConnectorOnEVSideDisconnect,
+    transactionActive: false
+  };
+}
+```
+
+**보안 권장:**
+```json
+{
+  "StopTransactionOnEVSideDisconnect": "true",
+  "UnlockConnectorOnEVSideDisconnect": "true"
+}
+```
+
+**이유:**
+- ✅ EV 측 케이블 뽑아도 즉시 트랜잭션 중지 (방해 행위 방지)
+- ✅ 사용자 편의성 (케이블 자유롭게 분리)
+- ✅ 새 트랜잭션 시작 필요 (보안)
+
+---
+
+### 💡 핵심 정리
+
+```
+StopTransaction = 충전 세션 종료 및 정산
+
+MUST (필수):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ CP: 트랜잭션 종료 시 StopTransaction.req 전송 (SHALL)
+✅ CP: transactionId 포함
+✅ CP: 정상 종료 시 케이블 잠금 해제 (SHALL)
+✅ CSMS: StopTransaction.conf 응답 전송 (SHALL, 항상!)
+✅ CSMS: 모든 요청/응답 이벤트 로그 저장
+
+MAY (선택):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ CP: idTag 포함 (사용자 중지 시)
+✅ CP: transactionData 포함 (미터 데이터)
+✅ CP: reason 생략 (정상 종료 시 → "Local" 가정)
+✅ CSMS: idTagInfo 포함 (Authorization Cache 업데이트용)
+✅ CSMS: 트랜잭션 중지 데이터에 대한 정상성 검사
+
+SHOULD (권장):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ CP: reason 설정 (비정상 종료 시)
+✅ CSMS: 데이터 정상성 검사 후에도 응답 필수!
+✅ CSMS: idTagInfo를 Authorization Cache 업데이트에 사용
+
+중요 규칙:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ CSMS는 트랜잭션 중지를 방지할 수 없음! (MAY only inform)
+⚠️ conf 응답 실패 시 CP가 계속 재전송함
+⚠️ StopTransactionOnEVSideDisconnect=false 시 UnlockConnectorOnEVSideDisconnect 무시 (SHALL)
+⚠️ StopTransactionOnEVSideDisconnect=true → 방해 행위 방지
+
+참고:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💡 SHALL = MUST (OCPP 스펙 용어)
 ```
 
